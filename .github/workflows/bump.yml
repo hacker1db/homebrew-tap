@@ -1,0 +1,38 @@
+name: bump formulas
+
+# Polls hacker1db/ai-usage for a newer release and updates the formulas that build from it.
+# Polling keeps the tap self-contained: no cross-repo token is needed.
+on:
+  schedule:
+    - cron: "17 */6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  bump:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Update ai-usage formulas to the latest release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="$(gh api repos/hacker1db/ai-usage/releases/latest -q .tag_name)"
+          [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "unexpected tag: $tag"; exit 1; }
+          url="https://github.com/hacker1db/ai-usage/archive/refs/tags/$tag.tar.gz"
+          if grep -qF "$url" Formula/ai-usage.rb; then
+            echo "already at $tag"; exit 0
+          fi
+          sha="$(curl -fsSL "$url" | sha256sum | cut -d' ' -f1)"
+          for f in Formula/ai-usage.rb Formula/foundry-entra-proxy.rb; do
+            sed -i -E \
+              -e "s|^  url \"https://github.com/hacker1db/ai-usage/archive/refs/tags/[^\"]+\"|  url \"$url\"|" \
+              -e "s|^  sha256 \"[0-9a-f]{64}\"|  sha256 \"$sha\"|" "$f"
+          done
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -am "chore: bump ai-usage formulas to $tag"
+          git push
