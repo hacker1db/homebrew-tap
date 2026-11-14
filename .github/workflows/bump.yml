@@ -1,11 +1,20 @@
 name: bump formulas
 
-# Polls hacker1db/ai-usage for a newer release and updates the formulas that build from it.
-# Polling keeps the tap self-contained: no cross-repo token is needed.
+# Points the ai-usage and foundry-entra-proxy formulas at the latest hacker1db/ai-usage release.
+# ai-usage's release workflow sends repository_dispatch `ai-usage-release` right after it publishes,
+# so updates land within minutes. The six-hour schedule is the fallback for a missing or failed
+# dispatch and needs no cross-repo token. Every run is safe to repeat: it never downgrades, does
+# nothing when the formulas are current, and commits only if main has not moved underneath it.
 on:
+  repository_dispatch:
+    types: [ai-usage-release]
   schedule:
     - cron: "17 */6 * * *"
   workflow_dispatch:
+
+concurrency:
+  group: bump-formulas
+  cancel-in-progress: false
 
 permissions:
   contents: write
@@ -15,24 +24,92 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Update ai-usage formulas to the latest release
+
+      - name: Test the updater
+        run: scripts/test-update-formulas.sh
+
+      - name: Resolve the latest release and its tarball
+        id: release
         env:
           GH_TOKEN: ${{ github.token }}
+          REQUESTED: ${{ github.event.client_payload.tag }}
         run: |
           set -euo pipefail
-          tag="$(gh api repos/hacker1db/ai-usage/releases/latest -q .tag_name)"
-          [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "unexpected tag: $tag"; exit 1; }
-          url="https://github.com/hacker1db/ai-usage/archive/refs/tags/$tag.tar.gz"
-          if grep -qF "$url" Formula/ai-usage.rb; then
-            echo "already at $tag"; exit 0
+          tag_re='^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'
+          if [[ -n "$REQUESTED" && ! "$REQUESTED" =~ $tag_re ]]; then
+            echo "::warning::ignoring malformed dispatch tag"
+            REQUESTED=""
           fi
-          sha="$(curl -fsSL "$url" | sha256sum | cut -d' ' -f1)"
-          for f in Formula/ai-usage.rb Formula/foundry-entra-proxy.rb; do
-            sed -i -E \
-              -e "s|^  url \"https://github.com/hacker1db/ai-usage/archive/refs/tags/[^\"]+\"|  url \"$url\"|" \
-              -e "s|^  sha256 \"[0-9a-f]{64}\"|  sha256 \"$sha\"|" "$f"
+          # The dispatch only says "look now"; the release API stays the source of truth. Give a
+          # just-published release a moment to show up as latest.
+          for attempt in 1 2 3 4; do
+            tag="$(gh api repos/hacker1db/ai-usage/releases/latest -q .tag_name)"
+            [[ -z "$REQUESTED" || "$tag" == "$REQUESTED" ]] && break
+            echo "latest is $tag, dispatch named $REQUESTED (attempt $attempt)"
+            [[ $attempt == 4 ]] || sleep 15
           done
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git commit -am "chore: bump ai-usage formulas to $tag"
-          git push
+          [[ "$tag" =~ $tag_re ]] || { echo "::error::unexpected latest tag: $tag"; exit 1; }
+          echo "latest release: $tag"
+
+          rc=0
+          scripts/update-formulas.sh newer "$tag" || rc=$?
+          if [[ $rc == 1 ]]; then echo "update=false" >>"$GITHUB_OUTPUT"; exit 0; fi
+          [[ $rc == 0 ]] || exit "$rc"
+
+          url="https://github.com/hacker1db/ai-usage/archive/refs/tags/$tag.tar.gz"
+          src="$RUNNER_TEMP/src.tar.gz"
+          curl -fsSL --retry 5 --retry-all-errors -o "$src" "$url"
+          top="ai-usage-${tag#v}"
+          listing="$(tar -tzf "$src")"
+          for want in "$top/go.mod" "$top/cmd/ai-usage/main.go" "$top/cmd/foundry-entra-proxy/main.go"; do
+            grep -qxF "$want" <<<"$listing" || { echo "::error::$url lacks $want"; exit 1; }
+          done
+          sha="$(sha256sum "$src" | cut -d' ' -f1)"
+          { echo "update=true"; echo "tag=$tag"; echo "sha=$sha"; } >>"$GITHUB_OUTPUT"
+
+      - name: Commit the update
+        if: steps.release.outputs.update == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.release.outputs.tag }}
+          SHA: ${{ steps.release.outputs.sha }}
+        run: |
+          set -euo pipefail
+          # Commit through the API so GitHub signs the commit. expectedHeadOid makes the write
+          # conditional on main not having moved since the fetch; on a race, refetch and retry.
+          query='mutation($input: CreateCommitOnBranchInput!) { createCommitOnBranch(input: $input) { commit { oid url } } }'
+          for attempt in 1 2 3; do
+            git fetch -q origin main
+            git checkout -q --detach origin/main
+            rc=0
+            scripts/update-formulas.sh newer "$TAG" || rc=$?
+            if [[ $rc == 1 ]]; then echo "main already has $TAG"; exit 0; fi
+            [[ $rc == 0 ]] || exit "$rc"
+            scripts/update-formulas.sh apply "$TAG" "$SHA"
+            for f in Formula/ai-usage.rb Formula/foundry-entra-proxy.rb; do ruby -c "$f" >/dev/null; done
+            git --no-pager diff --stat
+            body="$(jq -n \
+              --arg query "$query" \
+              --arg repo "$GITHUB_REPOSITORY" \
+              --arg head "$(git rev-parse HEAD)" \
+              --arg msg "chore: bump ai-usage formulas to $TAG" \
+              --arg a "$(base64 -w0 Formula/ai-usage.rb)" \
+              --arg b "$(base64 -w0 Formula/foundry-entra-proxy.rb)" \
+              '{query: $query, variables: {input: {
+                  branch: {repositoryNameWithOwner: $repo, branchName: "main"},
+                  expectedHeadOid: $head,
+                  message: {headline: $msg},
+                  fileChanges: {additions: [
+                    {path: "Formula/ai-usage.rb", contents: $a},
+                    {path: "Formula/foundry-entra-proxy.rb", contents: $b}]}}}}')"
+            if out="$(gh api graphql --input - <<<"$body" 2>&1)"; then
+              echo "$out" | jq -r '.data.createCommitOnBranch.commit.url'
+              echo "### bumped ai-usage formulas to $TAG" >>"$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+            echo "commit attempt $attempt failed: $out"
+            git checkout -q -- Formula
+            sleep $((attempt * 5))
+          done
+          echo "::error::could not commit the $TAG bump"
+          exit 1

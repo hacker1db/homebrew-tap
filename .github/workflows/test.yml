@@ -1,0 +1,21 @@
+name: test
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: shellcheck
+        run: shellcheck scripts/*.sh
+      - name: updater tests
+        run: scripts/test-update-formulas.sh
+      - name: formula syntax
+        run: for f in Formula/*.rb; do ruby -c "$f"; done
