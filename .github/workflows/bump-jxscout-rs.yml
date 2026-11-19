@@ -1,0 +1,91 @@
+name: Bump jxscout-rs
+
+# Polls hacker1db/jxscout-rs for a newer release and opens a PR that updates
+# Formula/jxscout-rs.rb (version + sha256 per platform). No cross-repo token
+# is needed; jxscout-rs can optionally nudge this with a repository_dispatch.
+on:
+  schedule:
+    - cron: "17 */6 * * *"
+  repository_dispatch:
+    types: [jxscout-rs-release]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: bump-jxscout-rs
+  cancel-in-progress: false
+
+jobs:
+  bump:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Find latest release
+        id: rel
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="$(gh api repos/hacker1db/jxscout-rs/releases/latest --jq .tag_name)"
+          # Only accept plain semver tags; the value lands in a file and a branch name.
+          if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "unexpected tag '$tag'" >&2; exit 1
+          fi
+          current="$(grep -o '/download/v[0-9.]*/' Formula/jxscout-rs.rb | head -1 | cut -d/ -f3)"
+          placeholder=0
+          grep -q 'sha256 "0\{64\}"' Formula/jxscout-rs.rb && placeholder=1
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          if [[ "$tag" == "$current" && "$placeholder" == 0 ]]; then
+            echo "up to date ($tag)"; echo "bump=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "bump=true" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Download checksums
+        if: steps.rel.outputs.bump == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.rel.outputs.tag }}
+        run: |
+          mkdir -p sums
+          gh release download "$TAG" -R hacker1db/jxscout-rs -p '*.tar.gz.sha256' -D sums
+          ls sums
+      - name: Update formula
+        if: steps.rel.outputs.bump == 'true'
+        env:
+          TAG: ${{ steps.rel.outputs.tag }}
+        run: |
+          python3 - <<'PY'
+          import os, pathlib, re
+          tag = os.environ["TAG"]
+          p = pathlib.Path("Formula/jxscout-rs.rb")
+          s = p.read_text()
+          s = re.sub(r'/download/v[^/]+/jxscout-rs-v[0-9.]+-', f'/download/{tag}/jxscout-rs-{tag}-', s)
+          for target in ["aarch64-apple-darwin", "x86_64-apple-darwin",
+                         "aarch64-unknown-linux-musl", "x86_64-unknown-linux-musl"]:
+              sha = pathlib.Path(f"sums/jxscout-rs-{tag}-{target}.tar.gz.sha256").read_text().split()[0]
+              assert re.fullmatch(r"[0-9a-f]{64}", sha), sha
+              pat = rf'(jxscout-rs-{re.escape(tag)}-{target}\.tar\.gz"\n\s*sha256 ")[0-9a-f]{{64}}'
+              s, n = re.subn(pat, rf"\g<1>{sha}", s)
+              assert n == 1, target
+          p.write_text(s)
+          PY
+          git diff
+      - name: Open PR
+        if: steps.rel.outputs.bump == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.rel.outputs.tag }}
+        run: |
+          branch="bump/jxscout-rs-${TAG}"
+          if git ls-remote --exit-code origin "refs/heads/${branch}" >/dev/null; then
+            echo "branch ${branch} already exists"; exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git switch -c "$branch"
+          git commit -am "chore: bump jxscout-rs to ${TAG}"
+          git push origin "$branch"
+          gh pr create --title "chore: bump jxscout-rs to ${TAG}" \
+            --body "Automated bump of \`Formula/jxscout-rs.rb\` to ${TAG} using the release's published sha256 files."
