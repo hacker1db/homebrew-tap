@@ -72,20 +72,30 @@ jobs:
           p.write_text(s)
           PY
           git diff
-      - name: Open PR
+      # Idempotent: the branch may already exist from an earlier run whose
+      # PR creation failed (e.g. Actions weren't allowed to create PRs).
+      # Reuse it, and (re)create the PR if none is open.
+      - name: Push branch and open PR
         if: steps.rel.outputs.bump == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ steps.rel.outputs.tag }}
         run: |
           branch="bump/jxscout-rs-${TAG}"
-          if git ls-remote --exit-code origin "refs/heads/${branch}" >/dev/null; then
-            echo "branch ${branch} already exists"; exit 0
-          fi
+          title="chore: bump jxscout-rs to ${TAG}"
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git switch -c "$branch"
-          git commit -am "chore: bump jxscout-rs to ${TAG}"
-          git push origin "$branch"
-          gh pr create --title "chore: bump jxscout-rs to ${TAG}" \
-            --body "Automated bump of \`Formula/jxscout-rs.rb\` to ${TAG} using the release's published sha256 files."
+          git commit -am "$title"
+          # Force: the branch only ever holds this generated commit.
+          git push --force origin "$branch"
+          open_pr="$(gh pr list --head "$branch" --state open --json number --jq '.[0].number // empty')"
+          if [[ -n "$open_pr" ]]; then
+            echo "PR #$open_pr already open for $branch (branch updated)"
+            exit 0
+          fi
+          if ! gh pr create --head "$branch" --title "$title" \
+              --body "Automated bump of \`Formula/jxscout-rs.rb\` to ${TAG} using the release's published sha256 files."; then
+            echo "::error::Could not open the bump PR. Enable Settings → Actions → General → 'Allow GitHub Actions to create and approve pull requests', then re-run this workflow (the branch ${branch} is ready)."
+            exit 1
+          fi
