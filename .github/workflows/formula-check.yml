@@ -1,0 +1,27 @@
+name: Formula check
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # Placeholder checksums must never reach main: a formula with them
+      # can't be installed.
+      - name: No placeholder sha256
+        run: |
+          if grep -rnE 'sha256 "0{64}"' Formula/; then
+            echo "::error::Formula has placeholder sha256 values. Tag the jxscout-rs release and run the 'Bump jxscout-rs' workflow (or paste the real checksums) before merging."
+            exit 1
+          fi
+      - name: Ruby syntax
+        run: for f in Formula/*.rb; do ruby -c "$f"; done
